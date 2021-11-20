@@ -34,11 +34,11 @@ the MTU post installation.
 Customers may need to change the MTU post-installation. However these changes
 aren't trivial and may cause downtime, hence the CNO currently forbids them.
 
-We propose a procedure that will be launched on demand. This procedure will
-run pods on every node of the cluster and make the necessary changes in an
-ordered and coordinated manner with a service disruption within the least
-possible time, which if under a reasonable time of 10 minutes, should be well
-under the typical TCP timeout interval.
+This enhancement proposes an automated procedure launched on demand and
+coordinated by the Cluster Network Operator. This procedure is based on
+draining and rebooting the nodes sequentially to minimize service disruption
+and to ensure that the nodes have a healthy configuration and preserve
+connectivity with each other.
 
 ## Motivation
 
@@ -52,98 +52,176 @@ changes in the underlay or because they were set incorrectly at install time.
 
 ### Non goals
 
-* Change the MTU without service disruption.
-
 * Other safe or unsafe configuration changes.
 
 ## Proposal
 
+Cluster Network Operator (CNO from now on) will drive the MTU change when it 
+detects a change on the configured value in the operator configuration. The
+procedure will include an automatic double rolling reboot triggered by CNO
+through Machine Config Operator (MCO from now on). Due to the reboots it is
+adecuate to consider this an MTU migration rather than just simply an MTU
+change. Given the impact that the reboots have on the cluster, a specific
+annotation will be introduced in the operator configuration to safeguard it.
+
+Up to now, CNO has not had any responsibility over the host MTU but it is
+critical to consider it for this MTU migration scenario to avoid service
+disruptions and unnecessary reboots.
+
+Changes are required on OVN-Kubernetes, CNO and MCO.
+
+### OVN-Kubernetes: new `routable-mtu` configuration parameter
+
+A new `routable-mtu` setting is introduced in OVN-Kubernetes to faciliate a
+procedure allowing to change the MTU on a running cluster with minimum service
+disruption.
+
+OVN-Kube Node, upon start, sets that `routable-mtu` on the appropriate host
+and new pod routes. This will make all node-wide outgoing traffic effectively
+adjust to that MTU value while the node and pod interfaces remain 
+configured with the original `mtu` value and thus capable of handling incoming
+traffic adjusted to that MTU value.
+
+This new setting enables a double rolling reboot procedure to change the MTU
+during which different MTU configurations accross nodes are tolerated with
+no service disruption.
+
+The general procedure, given current and target MTU values, is:
+1. Set `mtu` to the higher MTU value and `routable-mtu` to the lower MTU value.
+2. 
+2. Do a rolling reboot. As a node restarts, routable-mtu is set on
+   all appropriate routes while interfaces have mtu configured.
+   The node will effectively use the lower routable-mtu for outgoing
+   traffic, but be able to handle incoming traffic up to the higher
+   mtu.
+3. Change the MTU on all interfaces not handled by OVN-K to the target
+   MTU value. Change the MTU on all routes not handled by OVN-K
+   Since the MTU effectively used in the cluster is the lower
+   one, this has no impact on traffic.
+4. Set mtu to the target MTU value and unset routable-mtu.
+5. Do a rolling reboot. As a node restarts, the target MTU value is set
+   on the interfaces and the routes are reset to default MTU values.
+   Since the MTU effectively used in other nodes of the cluster is the
+   lower one but able to handle the higher one, this has no impact on
+   traffic.
+
+`routable-mtu` will be set as MTU in the following routes:
+* default route in pods, covering traffic from a pod to any destination that is
+  not a pod on the same host.
+* non link scoped management port routes in nodes, covering traffic from nodes
+  to services or pods on different nodes.
+
+#### MTU Decrease example
+
+Current MTU: 9000
+Current OVN-K MTU: 8900
+Target MTU: 1500
+Target OVN-K MTU: 1400
+
+* Set in ovn-config:
+  `mtu`: `8900` (no change)
+  `routable-mtu`: `1400` (previously unset)
+* Do a rolling reboot of all nodes. As nodes restart, outgoing traffic will be
+  adjusted to the `1400` MTU value which both restarted and non-restarted nodes
+  will be able to handle. Interfaces MTU will remain unchanged. Wait until all
+  nodes have restarted.
+* Set in ovn-config:
+  `mtu`: `1400` (changed from `8900`)
+  `routable-mtu`: `` (unset)
+* Set host default interface MTU to `1500`.
+* Do a rolling reboot of all nodes. This has the effect of setting the MTU on 
+  interfaces to `1400` and reseting the routes to a default unset MTU. At this
+  stage, since the effectively used MTU was already `1400`, there is no impact.
+
+#### MTU increase example
+
+Current MTU: 1500
+Current OVN-K MTU: 1400
+Target MTU: 9100
+Target OVN-K MTU: 9000
+
+* Set in ovn-config:
+  `mtu`: `9000` (changed from `1400`)
+  `routable-mtu`: `1400` (previously unset)
+* Do a rolling reboot of all nodes. As nodes restart, outgoing traffic will
+  still be adjusted to the `1400` MTU value which both restarted and
+  non-restarted nodes will be able to handle. Interfaces MTU will be reset to
+  `9000`. Wait until all nodes have restarted.
+* Set in ovn-config:
+  `mtu`: `9000` (no change)
+  `routable-mtu`: `` (unset)
+* Set host default interface MTU to `9100`.
+* Do a rolling reboot of all nodes. This has the effect of reseting the routes
+  to a default unset MTU and change the effective MTU in use to `9000`. At this
+  stage, since all cluster interfaces are already adjusted to that MTU, there
+  is no impact.
+
+### MCO: configurable MTU for configure-ovs service
+
+configure-ovs is a systemd service deployed through MCO that prepares host 
+networking for OVN-Kubernetes. The proposal is to introduce a systemd dropin
+for this service with two configuration parameters: `MTU` and `ROUTABLE_MTU`:
+* If `MTU` is set, configure-ovs will set that MTU value in br-ex and
+  ovs-if-phys0 interfaces.
+* If `ROUTABLE_MTU` is set, configure-ovs will set that MTU value to all
+  br-ex link scoped routes.
+* If `ROUTABLE_MTU` is unset, configure-ovs will unset the MTU value on all
+  br-ex link scoped routes.
+
+MCO will deploy by default this dropin with both parameters unset.
+
+### CNO: coordinate MTU change
+
 The CNO monitors changes on the operator configuration. When it detects a MTU
-change:
-1. Set the `clusteroperator/network` conditions:
-   - Progressing: true
-   - Upgradeable: false
-2. Check that the MTU value is valid, within threoretically min/max values.
-3. Check that all the nodes are on Ready state.
-4. Deploy pods on every node with `restartPolicy: Never` which are responsible
-   for validating the preconditions. If the preconditions are met the pod will
-   exit with code 0. Some of the preconditions that we will check are:
-   - The underlay network supports the intended MTU value.
-5. Once all the previous pods finish successfully, deploy other set of pods with
-   `restartPolicy: Never` on every node that will handle the actual change of
-   the MTU (explained in more detail below). Wait for them to be ready and
-   running.
-6. Ensure that the configmap ovnkube-config is synchronized with the new MTU
-   value.
-7. If any previous steps (1-6) was unsuccesful, the CNO will set the
-   `clusteroperator/network` conditions to:
-   - Progressing: false
-   - Degraded: true
-   Update the operator configuration status with a description of the problem.
-   At this point the process is interrupted and we require manual intervention.
-8. Force a rollout of the ovnkube-node daemonset. This will ensure
-   ovn-kubernetes uses the new MTU value for new pods as well as set the new MTU
-   on managed node interfaces like ovn-k8s-mp0, ovn-k8s-gw0 (local gateway mode)
-   and related routes.
-9. Set the new MTU value to the applied-cluster config map AND wait for pods of
-   step 3 to complete successfully.
-10. If any of the previous steps (8,9) failed, reboot the node, wait for the
-    kubelet to be reporting as Ready again.
-    If this step fails, set conditions to:
-    - Progressing: false
-    - Degraded: true
-    Update the operator configuration status with a description of the problem.
-11. Upon completion, set conditions to:
-    - Progressing: false
-    - Degraded: false
+change, given current and target MTU values:
+1. Check if an annotation `mtu-migration` is set in the operator. If not,     
+   consider the MTU change unsafe as done currently and don't proceed.
+2. Check if annotation `mtu-migration` has a value, and if so, that it is a 
+   valid host MTU value with respect to the OVN-Kubernetes MTU value set in the
+   operator configuration. If not, consider the MTU change unsafe and don't
+   proceed. Otherwise, consider this to be the host MTU value or assume a
+   default of the target MTU value + 100.
+2. Render the OVN-Kubernetes configuration with `mtu` set to the high MTU
+   value and `routable-mtu` to the low MTU value of the current and target MTU
+   values.
+3. Render the `cno-set-mtu-<pool>` MachineConfig object for both the `master`
+   and `worker` machine config pools containing the configure-ovs dropin with
+   `MTU` set to the host MTU value and `ROUTABLE_MTU` to the low MTU
+   value + 100.
+4. Wait until MCO has applied the Machine Config object and performed the
+   rolling reboot of all nodes.
+5. Render a OVN-Kubernetes configuration with `mtu` set to the target MTU
+   value and `routable-mtu` unset.
+6. Render the `cno-set-mtu-<pool>` MachineConfig object for both the `master`
+   and `worker` machine config pools containing a configure-ovs dropin with 
+   `MTU` and `ROUTABLE_MTU` unset.
+7. Wait until MCO has applied the Machine Config object and performed the
+   rolling reboot of all nodes.
+8. Set the target MTU value in CNO `applied-cluster` config map. MTU value in 
+   in CNO `applied-cluster` config map should stay at the current MTU value
+   until this step.
 
-The steps to change the MTU performed by pods of previous step 3 are:
-1. So that we don't have nodes doing things at different times and we have
-   everything synchronized, the pods will wait until the MTU value on the
-   applied-cluster configmap changes.
-2. Enter every network namespace. If an interface `eth0` exists in that
-   namespace with an ip address within the pod subnet, change the MTU of the
-   the veth pair.
-3. If any of these steps failed (1-3), the pod will exit with code 1, if all
-   were successful it will exit with code 0.
+CNO should be able to derive operator status from MachineConfig pool status.
+The MachineConfig pool status should only be taken into account if it sources a
+MachineConfig that has been rendered by CNO. If that is the case:
+* CNO status should be progressing if MachineConfig pool is status is updating.
+* CNO status should be degraded if MachineConfig pool is status is degraded.
 
-An administrator should be able to deploy a machine-config object to change
-the node MTU as well. If increasing the MTU, it will do so at the beginning
-of the procedure. If decreasing the MTU, it will do so at the end of the
-procedure.
+The CNO status is expected to be derived from MachineConfig pool status
+throughout the procedure since CNO renders MachineConfig objects. Outside of
+this procedure there is no MachineConfig objects rendered by CNO so CNO status
+should not be derived from MachineConfig pool status.
+
+Note that CNO transitioning from rendering to not rendering MachineConfig
+objects should not result in any machine updates since the contents of the
+final MachineConfig object rendered are effectively the default configure-ovs
+dropin resulting in no machine state change required.
 
 ### User Stories
 
-#### As an administrator, I want to change the node MTU
+#### As an administrator, I want to change the cluster MTU
 
-An administrator should be able to deploy a machine-object config object
-that configures the node MTU permanently. Ideally this would be achieved
-through the ability to run configure-ovs with an MTU parameter.
-configure-ovs should change the MTU of br-ex and ovs-if-phys0 with the
-least impact on the existing configuration to avoid any unnecessary
-disruption. This change should persist across reboots.
-
-#### As an administrator, I want to change the cluster network MTU
-
-An administrator should be able to change the cluster network MTU through
-CNO configuration change. This would encompass the following tasks:
-
-##### Implement a pod that changes the actual MTU on running pods
-
-Implement a pod that changes the actual MTU for both ends of the veth
-pair for pods hosted in the node where the pod runs as described in the
-proposal, and in the least possible time.
-
-##### Add support in ovnkube-node to reset MTU on start
-
-Make sure that upon restart, ovnkube-node resets the MTU on all the relevant
-interfaces, like ovn-k8s-mp0, ovn-k8s-gw0, br-int as well as related routes
-that currently have a MTU set.
-
-##### Add support in CNO for MTU change coordination
-
-Add support in CNO to allow and coordinate the MTU change for OVN-Kubernetes
-as described in the proposal.
+An administrator should be able to change the cluster MTU
 
 ### Implementation Details/Notes/Constraints
 
@@ -151,39 +229,28 @@ as described in the proposal.
 
 ### Open Questions
 
-* If changing the MTU on a node fails, do we have guarantee that we can still
-  reboot the node?
+* The proposed procedure is completly automated. Should we consider making some
+  of the steps manual as an option? Perhaps indicated through an alternate
+  annotation `manual-mtu-migration` that would have the effect of rendering the
+  MachineConfig objects unlabeled. The administrator could then add the label
+  to manually trigger the reboots. We could also offer the option to set which
+  MachineConfig pools to work with, to provide more control over the reboot
+  process.
+
 
 ### Test Plan
-We will create the following tests:
-1. An HTTPS server with a very large certificate, and multiple clients
-   in different nodes doing a single HTTPS request. The acceptance criteria
-   is TLS negotiation suceeds and HTTPS request returns 200 after every MTU
-   change.
 
-Packet loss, TCP retransmissions, increased latency, and reduced bandwidth and
-connectivity loss considered acceptable while the change is happening.
-
-While previous test is running, we will decrease the MTU, and
-once it's finished we'll increase it to it's previous value.
-
-This test will be two new jobs in CI, one for IPv4 and another for IPv6, that
-will be launched on demand.
+Two new CI tests, one for IPv4 and another for IPv6, that will run upstream
+network tests and verify that the MTU set is the one effectively used, both
+after increasing and decreasing the MTU values.
 
 ### Risks and Mitigations
 
-* If unexpected problems ocurr this procedure, the mitigation is an automated
-  node reboot. The worst possible outcome is a full unplanned reboot
-  of the cluster. Documentation should advertise of these possible
-  consequences. An alternate implementation with planned reboots is described
-  in the Alternatives section.
-* Even though the procedure takes place under the absolute TCP timeout interval,
-  applications might have their own timeout implementation. Service disruption
-  and how applications handle it is a risk that might need to be considered on
-  per application basis but that can not be reasonably scoped in this
-  enhancement.
-* During the procedure, different MTUs will be used throughout the cluster. Next
-  section analyzes the consequences in detail.
+* A cluster wide MTU change procedure cannot be carried out in an instant and
+  incurs the risk of having different MTUs in use accross the cluster at a given
+  time. While the described procedure in this enhancement prevents this with the
+  use of route MTUs, some consequences from using different MTUs in the cluster 
+  are analized in the following section for context.
 
 #### Running the cluster with different MTUs
 
@@ -216,7 +283,7 @@ configured MTU and drop larger packets before they are handed off to the system.
 
 Past that, OVN-K sets up flows in OVS br-ex for packets that are larger than pod
 MTU and sends them off to the network stack to generate ICMP `FRAG_NEEDED`
-messages. If these packets exceed  the MTU of br-ex, they will be dropped by OVS
+messages. If these packets exceed the MTU of br-ex, they will be dropped by OVS
 and never reach the network stack. Otherwise they will reach the network stack
 but not generate ICMP `FRAG_NEEDED` messages as network stack only does so for
 traffic being forwarded and not for traffic with that node as final destination.
@@ -252,34 +319,10 @@ end veth interface.
 
 ## Alternatives
 
-### New ovn-k setting: `routable-mtu`
+* An alternative was considered to perform the MTU change directly rolling out
+  the ovnkube-node daemon set with a new MTU value and changing all the running
+  pods MTU. This approach, while quicker and more convinient, was discarded
+  as it was considered less safe due to possible edge cases where the odd
+  chance of leaving pods behind with wrong MTU values was dificult to avoid, as
+  well as offering lease guarantess of minimizing service disruption.
 
-OVN-Kube Node, upon start, sets that `routable-mtu` on all the host routes and
-on all created pods routes. This will make all node-wide traffic effectively
-use that MTU value even though the interfaces might be configured with a higher
-MTU. Then, with a double rolling reboot procedure, it should be possible to
-change the MTU with no service disruption.
-
-Decrease example:
-* Set in ovn-config a `routable-mtu` setting lower than the `mtu` setting.
-* Do rolling reboot, as nodes restart they will effectively use lower MTU, but
-  since the actual interfaces MTU did not change they will not drop traffic
-  coming from other nodes.
-* Set in ovn-config a `mtu` equal to `routable-mtu` or replace `mtu` with the
-  `routing-mtu` value and remove the latter.
-* Do rolling reboot, as nodes restart they will do so with interfaces configured
-  the expected MTU. As other nodes are effectively using this MTU setting, no
-  traffic drop is expected.
-
-Increase example:
-* Set in ovn-config the actual `mtu` as `routable-mtu` and a new `mtu` setting
-  higher than `routable-mtu`.
-* Do rolling reboot, nodes will restart with the higer MTU setting configured
-  on their interfaces but still be effectively using the lower MTU.
-* Set in ovn-config a `mtu` equal to `routable-mtu` or replace `mtu` with the
-  value of `routing-mtu` value and remove the latter.
-* Do rolling reboot, as nodes restart they will use the higher MTU. As other
-  nodes already have this MTU set on their interfaces no drops are expected.
-
-These procedure should be coordinated with changing the MTU setting on br-ex
-and its physical port.
